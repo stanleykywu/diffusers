@@ -21,9 +21,13 @@ import logging
 import math
 import os
 import random
+import re
 import shutil
 from contextlib import nullcontext
 import subprocess
+import warnings
+
+warnings.simplefilter(action="ignore", category=FutureWarning)
 
 import accelerate
 import datasets
@@ -218,7 +222,7 @@ def log_validation(
 
         if global_step > 0:
             # Run CLIP Score
-            logger.info("Generating CLIP Score score... ")
+            logger.info("Generating CLIP Score... ")
             result = subprocess.run(
                 [
                     "/home/stanleywu/projects/video-easel/ml-mobileclip/venv-mobileclip-3.10/bin/python3",
@@ -227,6 +231,11 @@ def log_validation(
                     validation_dir,
                     "--threshold",
                     str(args.clip_score_threshold),
+                    "--metadata_jsonl",
+                    os.path.join(
+                        args.validation_image_dir,
+                        f"{args.captioner}_metadata.jsonl",
+                    ),
                 ],
                 capture_output=True,
                 text=True,
@@ -234,6 +243,26 @@ def log_validation(
             # Get the output as a float
             clip_score = float(result.stdout.split(":")[1].strip())
             log_commit["clip_score"] = clip_score
+        elif args.clip_score_threshold == "":
+            logger.info("Calculating CLIP Threshold...")
+            result = subprocess.run(
+                [
+                    "/home/stanleywu/projects/video-easel/ml-mobileclip/venv-mobileclip-3.10/bin/python3",
+                    "/home/stanleywu/projects/diffusion-ft/metrics/calc-clip-threshold.py",
+                    "--validation_dir",
+                    validation_dir,
+                    "--metadata_jsonl",
+                    os.path.join(
+                        args.validation_image_dir,
+                        f"{args.captioner}_metadata.jsonl",
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            extracted_floats = re.findall("\d+\.\d+", str(result))
+            args.clip_score_threshold = float(extracted_floats[-1]) / 100
+            logger.info(f"CLIP Threshold: {args.clip_score_threshold}")
 
         for tracker in accelerator.trackers:
             if tracker.name == "wandb":
@@ -645,6 +674,15 @@ def parse_args():
         action="store_true",
         help="whether during validation fid will be generated",
     )
+    parser.add_argument(
+        "--validation_image_dir", type=str, help="clean images directory"
+    )
+    parser.add_argument(
+        "--captioner",
+        type=str,
+        help="which captioner to use",
+        choices=["llava", "cogvlm", "blip"],
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -674,6 +712,8 @@ def main():
     args.lr_warmup_steps = poison_config["lr_warmup_steps"]
     args.validation_steps = poison_config["validation_steps"]
     args.fid_validation_steps = poison_config["fid_validation_steps"]
+    args.validation_image_dir = poison_config["validation_image_dir"]
+    args.captioner = poison_config["captioner"]
     args.checkpointing_steps = poison_config["checkpointing_steps"]
     args.train_batch_size = poison_config["train_batch_size"]
     args.gradient_accumulation_steps = poison_config["gradient_accumulation_steps"]
@@ -927,12 +967,27 @@ def main():
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
     total_training_amount = poison_config["total_data"]
-    clean_data_files = {"train": os.path.join(poison_config["clean_data_dir"], "**")}
+    training_image_fps = [
+        os.path.join(poison_config["clean_data_dir"], f"{image_id}.png")
+        for image_id in json.load(open(poison_config["clean_data_in_json"], "r")).keys()
+    ]
+    assert len(training_image_fps) == total_training_amount
+    # add metadata.jsonl
+    training_image_fps.append(
+        os.path.join(poison_config["clean_data_dir"], f"metadata.jsonl")
+    )
+    clean_data_files = {"train": training_image_fps}
     clean_dataset = load_dataset(
         "imagefolder",
         data_files=clean_data_files,
         cache_dir=args.cache_dir,
-    )["train"].shuffle(seed=args.seed)
+    )["train"]
+    clean_dataset = clean_dataset.rename_column(
+        f"{poison_config['captioner']}_text", "text"
+    )
+    logger.info(f"Selecting {poison_config['captioner']} generated captions")
+    clean_dataset = clean_dataset.shuffle(seed=args.seed)
+
     poison_datasets = []
     total_poison_amount = 0
     for poison_concept_dta in poison_config["poison"]:
